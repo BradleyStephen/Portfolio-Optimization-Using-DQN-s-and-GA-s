@@ -4,21 +4,22 @@ import random
 from datetime import datetime
 
 # Genetic Algorithm Parameters
-POPULATION_SIZE = 50
-GENERATIONS = 30  # Further reduced to prevent overfitting
-MUTATION_RATE = 0.4  # Further increased to introduce more randomness and avoid overfitting
+POPULATION_SIZE = 500    # Adjusted for balance
+GENERATIONS = 50         # Adjusted for balance
+MUTATION_RATE = 0.1      # Encourages exploration
+ELITISM_RATE = 0.05      # Maintains diversity
 
 # Investment Parameters
 BUDGET = 100000  # $100,000
-RISK_FREE_RATE = 0.01 / 252  # Approximate daily risk-free rate (1% annual)
+RISK_FREE_RATE = 0.01  # 1% annual risk-free rate
 
 # Portfolio Constraints
 MIN_WEIGHT = 0.0
-MAX_WEIGHT = 0.15  # Further reduced maximum allocation per stock to encourage greater diversification
-REGULARIZATION_FACTOR = 0.15  # Reduced penalty to balance exploration and diversification
-DROPOUT_RATE = 0.3  # Increased dropout rate for asset selection during training
+MAX_WEIGHT = 0.15  # Maximum allocation per stock
+REGULARIZATION_FACTOR = 0.1  # Reduced penalty to prevent overpowering the fitness
+RETURN_DIFF_PENALTY_FACTOR = 5.0  # Penalty for high discrepancy in returns
 
-LATEST_COMMON_START_DATE = '2019-05-10'  # Align all datasets to start from this date
+LATEST_COMMON_START_DATE = '2015-01-01'  # Align all datasets to start from this date
 
 def load_and_combine_datasets():
     """Load and combine stock datasets"""
@@ -44,27 +45,45 @@ def load_and_combine_datasets():
 
     stocks['Date'] = pd.to_datetime(stocks['Date'])
     stocks = stocks.sort_values('Date').reset_index(drop=True)
-    stocks.dropna(inplace=True)
+    
+    # Handle missing data
+    stocks.ffill(inplace=True)  # Forward-fill missing values
+    stocks.dropna(inplace=True)  # Drop remaining NaN values
+
+    # Print earliest date for debugging
+    print(f"Earliest Date in Combined Data: {stocks['Date'].min()}")
 
     # Save the combined dataset to a CSV file for visualization
     stocks.to_csv('trimSet.csv', index=False)
     
     return stocks
 
-def split_train_validation_test(stocks_df, train_ratio=0.6, validation_ratio=0.2):
-    """Split data into training, validation, and testing sets"""
-    train_end_idx = int(len(stocks_df) * train_ratio)
-    validation_end_idx = int(len(stocks_df) * (train_ratio + validation_ratio))
+def split_train_validation_test(stocks_df):
+    """Split data into training, validation, and testing sets based on date ranges"""
+    stocks_df['Date'] = pd.to_datetime(stocks_df['Date'])
     
-    train_df = stocks_df.iloc[:train_end_idx]
-    validation_df = stocks_df.iloc[train_end_idx:validation_end_idx]
-    test_df = stocks_df.iloc[validation_end_idx:]
+    # Adjust date ranges based on data availability
+    earliest_date = stocks_df['Date'].min()
+    latest_date = stocks_df['Date'].max()
+    print(f"Data available from {earliest_date} to {latest_date}")
+
+    # Define date ranges
+    train_end_date = '2020-12-31'
+    validation_end_date = '2021-06-30'
     
+    # Split data
+    train_df = stocks_df[stocks_df['Date'] <= train_end_date]
+    validation_df = stocks_df[(stocks_df['Date'] > train_end_date) & (stocks_df['Date'] <= validation_end_date)]
+    test_df = stocks_df[stocks_df['Date'] > validation_end_date]
+    
+    # Print data split info
     print(f"\nData Split:")
     print(f"Training period: {train_df['Date'].min()} to {train_df['Date'].max()}")
+    print(f"Training samples: {len(train_df)}")
     print(f"Validation period: {validation_df['Date'].min()} to {validation_df['Date'].max()}")
+    print(f"Validation samples: {len(validation_df)}")
     print(f"Testing period: {test_df['Date'].min()} to {test_df['Date'].max()}")
-    print(f"Training samples: {len(train_df)}, Validation samples: {len(validation_df)}, Testing samples: {len(test_df)}")
+    print(f"Testing samples: {len(test_df)}")
     
     return train_df, validation_df, test_df
 
@@ -79,16 +98,17 @@ def calculate_returns(df):
 def portfolio_metrics(weights, returns_df):
     """Calculate portfolio metrics including Sharpe ratio"""
     portfolio_returns = returns_df.dot(weights)
-    mean_return = portfolio_returns.mean()
-    return_std = portfolio_returns.std()
+    mean_daily_return = portfolio_returns.mean()
+    daily_return_std = portfolio_returns.std()
     
-    if return_std == 0:
-        return 0, 0, 0, 0, 0  # Avoid division by zero
+    if daily_return_std == 0:
+        return 0, 0, 0, 0, 0, 0, 0  # Avoid division by zero
     
-    sharpe_ratio = (mean_return - RISK_FREE_RATE) / return_std
+    # Annualize the returns
+    annual_return = mean_daily_return * 252
+    annual_std = daily_return_std * np.sqrt(252)
     
-    # Annualize the Sharpe ratio
-    annual_sharpe_ratio = sharpe_ratio * np.sqrt(252)
+    sharpe_ratio = (annual_return - RISK_FREE_RATE) / annual_std
     
     # Calculate maximum drawdown
     cum_returns = (1 + portfolio_returns).cumprod()
@@ -99,24 +119,44 @@ def portfolio_metrics(weights, returns_df):
     # Calculate total return over the entire period
     total_return = cum_returns.iloc[-1] - 1
     
-    return annual_sharpe_ratio, mean_return, return_std, max_drawdown, total_return
+    # Calculate Sortino Ratio
+    negative_returns = portfolio_returns[portfolio_returns < 0]
+    downside_std = negative_returns.std() * np.sqrt(252)
+    sortino_ratio = (annual_return - RISK_FREE_RATE) / downside_std if downside_std != 0 else 0
+    
+    # Calculate Calmar Ratio
+    calmar_ratio = (annual_return - RISK_FREE_RATE) / abs(max_drawdown) if max_drawdown != 0 else 0
+    
+    return sharpe_ratio, annual_return, annual_std, max_drawdown, total_return, sortino_ratio, calmar_ratio
 
-def portfolio_sharpe_ratio(weights, returns_df):
-    """Fitness function for genetic algorithm, with regularization to encourage diversification"""
+def portfolio_fitness(weights, train_returns, validation_returns):
+    """Fitness function that evaluates performance on validation data and penalizes high training returns"""
     if not all(MIN_WEIGHT <= w <= MAX_WEIGHT for w in weights) or abs(sum(weights) - 1) > 1e-6:
         return -np.inf
+
+    # Calculate Sharpe ratios and returns on training and validation data
+    sharpe_ratio_train, annual_return_train, _, _, _, _, _ = portfolio_metrics(weights, train_returns)
+    sharpe_ratio_val, annual_return_val, _, _, _, _, _ = portfolio_metrics(weights, validation_returns)
     
-    sharpe_ratio, _, _, _, _ = portfolio_metrics(weights, returns_df)
-    regularization_penalty = REGULARIZATION_FACTOR * np.sum(weights ** 2)
-    return sharpe_ratio - regularization_penalty
+    # Regularization term
+    l2_penalty = REGULARIZATION_FACTOR * np.sum(np.square(weights))
+
+    # Penalty for high training return compared to validation return
+    return_diff_penalty = RETURN_DIFF_PENALTY_FACTOR * max(0, (annual_return_train - annual_return_val))
+
+    # Fitness function
+    fitness = sharpe_ratio_val - l2_penalty - return_diff_penalty
+
+    return fitness
 
 def initialize_population(pop_size, num_stocks):
     """Initialize random portfolio weights"""
     population = []
     while len(population) < pop_size:
         weights = np.random.dirichlet(np.ones(num_stocks))
-        if all(MIN_WEIGHT <= w <= MAX_WEIGHT for w in weights):
-            population.append(weights)
+        weights = np.clip(weights, MIN_WEIGHT, MAX_WEIGHT)
+        weights /= weights.sum()
+        population.append(weights)
     return population
 
 def select_parents(population, fitness_values, tournament_size=3):
@@ -132,6 +172,7 @@ def crossover(parent1, parent2):
     """Perform crossover between two parents"""
     alpha = random.random()
     child = alpha * parent1 + (1 - alpha) * parent2
+    child = np.clip(child, MIN_WEIGHT, MAX_WEIGHT)
     child /= child.sum()  # Normalize
     return child
 
@@ -139,7 +180,7 @@ def mutate(child, mutation_rate):
     """Mutate child weights"""
     for i in range(len(child)):
         if random.random() < mutation_rate:
-            mutation = np.random.normal(0, 0.05)
+            mutation = np.random.normal(0, 0.02)  # Reduced mutation magnitude for stability
             child[i] += mutation
     
     child = np.clip(child, MIN_WEIGHT, MAX_WEIGHT)
@@ -149,69 +190,59 @@ def mutate(child, mutation_rate):
         child /= child.sum()
     return child
 
-def apply_dropout(weights, dropout_rate):
-    """Apply dropout to the portfolio weights to encourage diversification"""
-    dropout_mask = np.random.binomial(1, 1 - dropout_rate, size=len(weights))
-    weights = weights * dropout_mask
-    if weights.sum() == 0:
-        weights = np.ones_like(weights) / len(weights)
-    else:
-        weights /= weights.sum()
-    return weights
-
-def genetic_algorithm(train_returns, validation_returns, generations, pop_size, mutation_rate):
-    """Main genetic algorithm function with early stopping and dropout"""
+def genetic_algorithm(train_returns, validation_returns, generations, pop_size, mutation_rate, elitism_rate):
+    """Main genetic algorithm function with adjusted fitness function"""
     num_stocks = len(train_returns.columns)
     population = initialize_population(pop_size, num_stocks)
-    best_fitness_history = []
     best_weights = None
-    best_validation_fitness = -np.inf
-    early_stopping_rounds = 15  # Increased to make early stopping less sensitive
+    best_fitness = -np.inf
     no_improvement_count = 0
-    
+    early_stopping_rounds = 15  # Allows for sufficient exploration
+
     for generation in range(generations):
-        fitness_values = [portfolio_sharpe_ratio(ind, train_returns) for ind in population]
-        best_fitness = max(fitness_values)
-        best_fitness_history.append(best_fitness)
-        
-        if generation % 10 == 0:
-            print(f"Generation {generation}, Best Fitness: {best_fitness:.4f}")
-        
-        new_population = []
+        # Evaluate fitness
+        fitness_values = [portfolio_fitness(ind, train_returns, validation_returns) for ind in population]
+
+        # Sort population by fitness
+        sorted_population = [x for _, x in sorted(zip(fitness_values, population), key=lambda pair: pair[0], reverse=True)]
+        fitness_values_sorted = sorted(fitness_values, reverse=True)
+
+        # Elitism
+        elite_size = int(elitism_rate * pop_size)
+        elites = sorted_population[:elite_size]
+
+        new_population = elites.copy()
         while len(new_population) < pop_size:
-            parent1, parent2 = select_parents(population, fitness_values)
+            parent1, parent2 = select_parents(sorted_population, fitness_values_sorted)
             child = crossover(parent1, parent2)
             child = mutate(child, mutation_rate)
-            child = apply_dropout(child, DROPOUT_RATE)  # Apply dropout to encourage diversification
             new_population.append(child)
-        
+
         population = new_population
-        
-        # Early stopping based on validation fitness
-        validation_fitness_values = [portfolio_sharpe_ratio(ind, validation_returns) for ind in population]
-        current_best_validation_fitness = max(validation_fitness_values)
-        if current_best_validation_fitness > best_validation_fitness:
-            best_validation_fitness = current_best_validation_fitness
-            best_weights = population[np.argmax(validation_fitness_values)]
+
+        # Keep track of best weights based on fitness
+        current_best_fitness = fitness_values_sorted[0]
+        if current_best_fitness > best_fitness:
+            best_fitness = current_best_fitness
+            best_weights = sorted_population[0]  # Corrected to select from sorted_population
             no_improvement_count = 0
         else:
             no_improvement_count += 1
-        
+
         if no_improvement_count >= early_stopping_rounds:
-            print("Early stopping triggered due to no improvement in validation fitness.")
+            print("Early stopping triggered due to no improvement in fitness.")
             break
-    
-    return best_weights, best_fitness_history
+
+        if generation % 5 == 0 or generation == generations - 1:
+            print(f"Generation {generation}, Best Fitness: {fitness_values_sorted[0]:.4f}")
+
+    return best_weights
 
 def evaluate_portfolio(weights, returns_df, stock_names, period_name=""):
     """Evaluate portfolio performance"""
     print(f"\n{period_name} Portfolio Evaluation:")
     
-    # Calculate metrics
-    sharpe_ratio, mean_return, return_std, max_drawdown, total_return = portfolio_metrics(weights, returns_df)
-    
-    # Annualize the expected return
-    annual_return = mean_return * 252
+    sharpe_ratio, annual_return, annual_std, max_drawdown, total_return, sortino_ratio, calmar_ratio = portfolio_metrics(weights, returns_df)
     
     # Print allocation
     print("\nOptimal Allocation:")
@@ -219,18 +250,21 @@ def evaluate_portfolio(weights, returns_df, stock_names, period_name=""):
         print(f"{stock}: {weight:.2%} (${BUDGET * weight:.2f})")
     
     # Print metrics
-    print(f"\nExpected Daily Return: {mean_return:.4%}")
-    print(f"Expected Annual Return: {annual_return:.2%}")
-    print(f"Portfolio Standard Deviation (Daily): {return_std:.4%}")
-    print(f"Sharpe Ratio (Annualized): {sharpe_ratio:.4f}")
+    print(f"\nExpected Annual Return: {annual_return:.2%}")
+    print(f"Annual Volatility (Std Dev): {annual_std:.2%}")
+    print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
+    print(f"Sortino Ratio: {sortino_ratio:.4f}")
+    print(f"Calmar Ratio: {calmar_ratio:.4f}")
     print(f"Maximum Drawdown: {max_drawdown:.2%}")
     print(f"Total Period Return: {total_return:.2%}")
     print(f"Total Profit/Loss: ${BUDGET * total_return:.2f}")
     
     return {
         'sharpe_ratio': sharpe_ratio,
-        'mean_return': mean_return,
-        'std_dev': return_std,
+        'sortino_ratio': sortino_ratio,
+        'calmar_ratio': calmar_ratio,
+        'annual_return': annual_return,
+        'annual_std_dev': annual_std,
         'max_drawdown': max_drawdown,
         'total_return': total_return
     }
@@ -241,8 +275,12 @@ def main():
     stocks_df = load_and_combine_datasets()
     
     # Split into training, validation, and testing sets
-    train_df, validation_df, test_df = split_train_validation_test(stocks_df, train_ratio=0.6, validation_ratio=0.2)
+    train_df, validation_df, test_df = split_train_validation_test(stocks_df)
     
+    # Check if training data is empty
+    if train_df.empty:
+        raise ValueError("Training dataset is empty. Please adjust your date ranges or check your data.")
+
     # Calculate returns for each set
     train_returns, stock_names = calculate_returns(train_df)
     validation_returns, _ = calculate_returns(validation_df)
@@ -250,14 +288,14 @@ def main():
     
     # Run genetic algorithm on training data with validation
     print("\nOptimizing portfolio weights using training and validation data...")
-    best_weights, fitness_history = genetic_algorithm(
-        train_returns, validation_returns, GENERATIONS, POPULATION_SIZE, MUTATION_RATE
+    best_weights = genetic_algorithm(
+        train_returns, validation_returns, GENERATIONS, POPULATION_SIZE, MUTATION_RATE, ELITISM_RATE
     )
     
     # Evaluate on training, validation, and testing sets
     train_metrics = evaluate_portfolio(best_weights, train_returns, stock_names, "Training")
     validation_metrics = evaluate_portfolio(best_weights, validation_returns, stock_names, "Validation")
-    test_metrics = evaluate_portfolio(best_weights, test_returns, stock_names, "Testing")
+    test_metrics = evaluate_portfolio(best_weights, test_returns, stock_names, "Testing")  # Fixed duplication
     
     # Print comparison
     print("\nPerformance Comparison:")
@@ -266,9 +304,8 @@ def main():
     print(f"Testing Sharpe Ratio: {test_metrics['sharpe_ratio']:.4f}")
     print(f"Training Return: {train_metrics['total_return']:.2%}")
     print(f"Validation Return: {validation_metrics['total_return']:.2%}")
-
     print(f"Testing Return: {test_metrics['total_return']:.2%}")
-
+    
     # Check for overfitting
     if train_metrics['sharpe_ratio'] > 2 * test_metrics['sharpe_ratio']:
         print("\nWarning: The model may be overfitting to the training data. Consider adjusting the Genetic Algorithm parameters or using more data.")
