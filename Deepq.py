@@ -3,6 +3,7 @@ import pandas as pd
 import random
 import tensorflow as tf
 from collections import deque
+import matplotlib.pyplot as plt  # Added for plotting
 
 # Portfolio and DQN Parameters
 BUDGET = 100000
@@ -186,7 +187,7 @@ class DQNAgent:
         if self.epsilon > EPSILON_MIN:
             self.epsilon *= EPSILON_DECAY
 
-def train_dqn(returns_df, risk_free_rate=RISK_FREE_RATE):
+def train_dqn(returns_df, stock_names, risk_free_rate=RISK_FREE_RATE):
     """Train the DQN agent."""
     initial_weights = np.ones(returns_df.shape[1]) / returns_df.shape[1]
     env = PortfolioEnv(returns_df, initial_weights)
@@ -237,12 +238,15 @@ def train_dqn(returns_df, risk_free_rate=RISK_FREE_RATE):
 
         # Log episode summary
         final_weights = state[:env.n_assets]
+        # Include stock names next to weights
+        weight_info = ', '.join([f"{name}: {weight:.4f}" for name, weight in zip(stock_names, final_weights)])
         print(f"Episode {episode + 1}/{MAX_EPISODES}")
         print(f"  Total Reward: {total_reward:.2f}")
         print(f"  Cumulative Return: {cumulative_return:.2%}")
         print(f"  Sharpe Ratio: {sharpe_ratio:.4f}")
         print(f"  Max Drawdown: {max_drawdown:.2%}")
-        print(f"  Final Portfolio Weights: {np.round(final_weights, 4)}")
+        print(f"  Final Portfolio Weights:")
+        print(f"    {weight_info}")
         print(f"  Epsilon (Exploration Rate): {agent.epsilon:.2f}\n")
 
     # Summary of training performance
@@ -251,6 +255,35 @@ def train_dqn(returns_df, risk_free_rate=RISK_FREE_RATE):
     print(f"  Average Cumulative Return: {np.mean(cumulative_rewards):.2%}")
     print(f"  Average Sharpe Ratio: {np.mean(sharpe_ratios):.4f}")
     print(f"  Average Max Drawdown: {np.mean(max_drawdowns):.2%}")
+
+    # Plotting metrics over episodes
+    episodes = range(1, MAX_EPISODES + 1)
+
+    plt.figure(figsize=(12, 8))
+
+    plt.subplot(3, 1, 1)
+    plt.plot(episodes, cumulative_rewards, label='Cumulative Return')
+    plt.xlabel('Episode')
+    plt.ylabel('Cumulative Return')
+    plt.title('Cumulative Return over Episodes')
+    plt.legend()
+
+    plt.subplot(3, 1, 2)
+    plt.plot(episodes, sharpe_ratios, label='Sharpe Ratio', color='orange')
+    plt.xlabel('Episode')
+    plt.ylabel('Sharpe Ratio')
+    plt.title('Sharpe Ratio over Episodes')
+    plt.legend()
+
+    plt.subplot(3, 1, 3)
+    plt.plot(episodes, max_drawdowns, label='Max Drawdown', color='red')
+    plt.xlabel('Episode')
+    plt.ylabel('Max Drawdown')
+    plt.title('Max Drawdown over Episodes')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 def main():
     # Load and preprocess stock data
@@ -262,7 +295,7 @@ def main():
 
     # Train the DQN agent
     print("\nTraining the DQN agent...")
-    train_dqn(returns_df)
+    train_dqn(returns_df, stock_names)
 
 if __name__ == "__main__":
     main()
