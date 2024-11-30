@@ -3,11 +3,15 @@ import pandas as pd
 import random
 from datetime import datetime
 
+# Set fixed random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+
 # Genetic Algorithm Parameters
-POPULATION_SIZE = 500    # Keeping your optimized parameters
-GENERATIONS = 50         # Keeping your optimized parameters
-MUTATION_RATE = 0.1      # Keeping your optimized parameters
-ELITISM_RATE = 0.05      # Maintains diversity
+POPULATION_SIZE = 500
+GENERATIONS = 50
+MUTATION_RATE = 0.1
+ELITISM_RATE = 0.05
 
 # Investment Parameters
 BUDGET = 100000  # $100,000
@@ -15,11 +19,11 @@ RISK_FREE_RATE = 0.01  # 1% annual risk-free rate
 
 # Portfolio Constraints
 MIN_WEIGHT = 0.0
-MAX_WEIGHT = 0.15  # Keeping your optimized parameters
-REGULARIZATION_FACTOR = 0.2  # Increased L2 regularization factor
-RETURN_RATIO_PENALTY_FACTOR = 50.0  # New penalty factor for return ratio
-L1_REGULARIZATION_FACTOR = 0.02  # Increased L1 regularization to encourage sparsity
-SHARPE_DIFF_PENALTY_FACTOR = 5.0  # Penalty factor for Sharpe ratio discrepancy
+MAX_WEIGHT = 0.15
+REGULARIZATION_FACTOR = 0.2
+RETURN_RATIO_PENALTY_FACTOR = 50.0
+L1_REGULARIZATION_FACTOR = 0.02
+SHARPE_DIFF_PENALTY_FACTOR = 5.0
 
 LATEST_COMMON_START_DATE = '2015-01-01'  # Align all datasets to start from this date
 
@@ -61,7 +65,7 @@ def load_and_combine_datasets():
     return stocks
 
 def split_train_test(stocks_df):
-    """Split data into training and testing sets based on date ranges"""
+    """Split data into training and testing sets based on an 80/20 split"""
     stocks_df['Date'] = pd.to_datetime(stocks_df['Date'])
     
     # Adjust date ranges based on data availability
@@ -69,20 +73,21 @@ def split_train_test(stocks_df):
     latest_date = stocks_df['Date'].max()
     print(f"Data available from {earliest_date} to {latest_date}")
 
-    # Define date ranges
-    test_start_date = '2021-07-01'
-    
+    # Calculate the index to split at (80% of the data)
+    split_index = int(0.8 * len(stocks_df))
+    split_date = stocks_df['Date'].iloc[split_index]
+
     # Split data
-    train_df = stocks_df[stocks_df['Date'] < test_start_date]
-    test_df = stocks_df[stocks_df['Date'] >= test_start_date]
-    
+    train_df = stocks_df[stocks_df['Date'] < split_date]
+    test_df = stocks_df[stocks_df['Date'] >= split_date]
+
     # Print data split info
     print(f"\nData Split:")
     print(f"Training period: {train_df['Date'].min()} to {train_df['Date'].max()}")
     print(f"Training samples: {len(train_df)}")
     print(f"Testing period: {test_df['Date'].min()} to {test_df['Date'].max()}")
     print(f"Testing samples: {len(test_df)}")
-    
+
     return train_df, test_df
 
 def calculate_returns(df):
@@ -102,35 +107,36 @@ def portfolio_metrics(weights, returns_df):
     
     if daily_return_std == 0:
         return 0, 0, 0, 0, 0, 0, 0  # Avoid division by zero
-    
+
     # Annualize the returns
     annual_return = mean_daily_return * 252
     annual_std = daily_return_std * np.sqrt(252)
-    
+
     sharpe_ratio = (annual_return - RISK_FREE_RATE) / annual_std
-    
+
     # Calculate maximum drawdown
     cum_returns = (1 + portfolio_returns).cumprod()
-    rolling_max = cum_returns.expanding().max()
+    rolling_max = cum_returns.cummax()
     drawdowns = (cum_returns - rolling_max) / rolling_max
     max_drawdown = drawdowns.min()
-    
+
     # Calculate total return over the entire period
     total_return = cum_returns.iloc[-1] - 1
-    
-    # Annualized total return
+
+    # Number of trading days in the period
     num_days = len(portfolio_returns)
-    num_years = num_days / 252  # Assuming 252 trading days per year
-    annualized_total_return = (1 + total_return) ** (1 / num_years) - 1
-    
+
+    # Annualized total return adjusted for period length
+    annualized_total_return = (1 + total_return) ** (252 / num_days) - 1
+
     # Calculate Sortino Ratio
     negative_returns = portfolio_returns[portfolio_returns < 0]
     downside_std = negative_returns.std() * np.sqrt(252)
     sortino_ratio = (annual_return - RISK_FREE_RATE) / downside_std if downside_std != 0 else 0
-    
+
     # Calculate Calmar Ratio
     calmar_ratio = (annual_return - RISK_FREE_RATE) / abs(max_drawdown) if max_drawdown != 0 else 0
-    
+
     return sharpe_ratio, annual_return, annual_std, max_drawdown, annualized_total_return, sortino_ratio, calmar_ratio
 
 def rolling_window_cross_validation(returns_df, window_size, step_size):
@@ -260,7 +266,7 @@ def genetic_algorithm_cv(returns_df, generations, pop_size, mutation_rate, eliti
         current_best_fitness = fitness_values_sorted[0]
         if current_best_fitness > best_fitness:
             best_fitness = current_best_fitness
-            best_weights = sorted_population[0]  # Corrected to select from sorted_population
+            best_weights = sorted_population[0]
             no_improvement_count = 0
         else:
             no_improvement_count += 1
@@ -309,7 +315,7 @@ def main():
     print("Loading and combining datasets...")
     stocks_df = load_and_combine_datasets()
     
-    # Split into training and testing sets
+    # Split into training and testing sets using 80/20 split
     train_df, test_df = split_train_test(stocks_df)
     
     # Check if training data is empty
