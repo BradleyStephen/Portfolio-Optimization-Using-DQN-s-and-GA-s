@@ -58,7 +58,13 @@ def calculate_returns(stocks_df):
     close_cols = [f"{stock}_Close" for stock in stock_names]
     returns_df = stocks_df[close_cols].pct_change().dropna()
     returns_df.columns = stock_names
-    return returns_df, stock_names
+    
+    # Split data into training and testing sets (80-20 split)
+    train_size = int(len(returns_df) * 0.8)
+    train_data = returns_df.iloc[:train_size]
+    test_data = returns_df.iloc[train_size:]
+    
+    return train_data, test_data, stock_names
 
 class PortfolioEnv:
     """Portfolio optimization environment."""
@@ -147,10 +153,10 @@ class DQNAgent:
         """Store experience in replay buffer."""
         self.memory.append((state, action, reward, next_state, done))
 
-    def act(self, state):
+    def act(self, state, testing=False):
         """Choose an action using an epsilon-greedy strategy."""
-        if np.random.rand() <= self.epsilon:
-            # Exploration: Random action
+        if not testing and np.random.rand() <= self.epsilon:
+            # Exploration: Random action (only during training)
             return random.randrange(self.action_size)
         else:
             # Exploitation: Predict Q-values and take the action with the highest value
@@ -187,32 +193,34 @@ class DQNAgent:
         if self.epsilon > EPSILON_MIN:
             self.epsilon *= EPSILON_DECAY
 
-def train_dqn(returns_df, stock_names, risk_free_rate=RISK_FREE_RATE):
-    """Train the DQN agent."""
-    initial_weights = np.ones(returns_df.shape[1]) / returns_df.shape[1]
-    env = PortfolioEnv(returns_df, initial_weights)
-    agent = DQNAgent(state_size=env.state.size, action_size=env.action_size)
-
+def train_and_evaluate_dqn(train_data, test_data, stock_names, risk_free_rate=RISK_FREE_RATE):
+    """Train the DQN agent and evaluate on test data."""
+    # Training phase
+    print("\nTraining Phase:")
+    initial_weights = np.ones(train_data.shape[1]) / train_data.shape[1]
+    train_env = PortfolioEnv(train_data, initial_weights)
+    agent = DQNAgent(state_size=train_env.state.size, action_size=train_env.action_size)
+    
     # Initialize logging variables
     cumulative_rewards = []
     sharpe_ratios = []
     max_drawdowns = []
 
     for episode in range(MAX_EPISODES):
-        state = env.reset()
+        state = train_env.reset()
         total_reward = 0
         episode_returns = []
         portfolio_values = [1.0]  # Starting portfolio value (normalized)
 
         for step in range(MAX_STEPS):
             action = agent.act(state)
-            next_state, reward, done = env.step(action)
+            next_state, reward, done = train_env.step(action)
             agent.remember(state, action, reward, next_state, done)
             state = next_state
             total_reward += reward
 
             # Track returns for cumulative performance metrics
-            portfolio_return = state[env.n_assets:][-1]  # Latest portfolio return
+            portfolio_return = state[train_env.n_assets:][-1]  # Latest portfolio return
             episode_returns.append(portfolio_return)
             portfolio_values.append(portfolio_values[-1] * (1 + portfolio_return))
 
@@ -237,8 +245,7 @@ def train_dqn(returns_df, stock_names, risk_free_rate=RISK_FREE_RATE):
         max_drawdowns.append(max_drawdown)
 
         # Log episode summary
-        final_weights = state[:env.n_assets]
-        # Include stock names next to weights
+        final_weights = state[:train_env.n_assets]
         weight_info = ', '.join([f"{name}: {weight:.4f}" for name, weight in zip(stock_names, final_weights)])
         print(f"Episode {episode + 1}/{MAX_EPISODES}")
         print(f"  Total Reward: {total_reward:.2f}")
@@ -249,16 +256,39 @@ def train_dqn(returns_df, stock_names, risk_free_rate=RISK_FREE_RATE):
         print(f"    {weight_info}")
         print(f"  Epsilon (Exploration Rate): {agent.epsilon:.2f}\n")
 
-    # Summary of training performance
-    print("\nTraining Complete!")
-    print("Final Results:")
-    print(f"  Average Cumulative Return: {np.mean(cumulative_rewards):.2%}")
-    print(f"  Average Sharpe Ratio: {np.mean(sharpe_ratios):.4f}")
-    print(f"  Average Max Drawdown: {np.mean(max_drawdowns):.2%}")
+    # Plot training metrics
+    plot_training_metrics(cumulative_rewards, sharpe_ratios, max_drawdowns)
 
-    # Plotting metrics over episodes
+    # Testing phase
+    print("\nTesting Phase:")
+    test_env = PortfolioEnv(test_data, initial_weights)
+    test_returns = []
+    portfolio_values = [1.0]
+    
+    state = test_env.reset()
+    test_weights_history = []
+    
+    while True:
+        action = agent.act(state, testing=True)  # Use testing mode
+        next_state, reward, done = test_env.step(action)
+        portfolio_return = next_state[test_env.n_assets:][-1]
+        test_returns.append(portfolio_return)
+        portfolio_values.append(portfolio_values[-1] * (1 + portfolio_return))
+        test_weights_history.append(next_state[:test_env.n_assets])
+        
+        if done:
+            break
+        state = next_state
+    
+    # Calculate and display test metrics
+    print_test_results(test_returns, portfolio_values, test_weights_history, stock_names, risk_free_rate)
+    
+    return agent
+
+def plot_training_metrics(cumulative_rewards, sharpe_ratios, max_drawdowns):
+    """Plot training metrics over episodes."""
     episodes = range(1, MAX_EPISODES + 1)
-
+    
     plt.figure(figsize=(12, 8))
 
     plt.subplot(3, 1, 1)
@@ -285,17 +315,34 @@ def train_dqn(returns_df, stock_names, risk_free_rate=RISK_FREE_RATE):
     plt.tight_layout()
     plt.show()
 
+def print_test_results(test_returns, portfolio_values, test_weights_history, stock_names, risk_free_rate):
+    """Print test phase results."""
+    test_cumulative_return = portfolio_values[-1] - 1
+    test_sharpe_ratio = (np.mean(test_returns) - risk_free_rate) / np.std(test_returns)
+    test_max_drawdown = np.min((np.array(portfolio_values) - np.maximum.accumulate(portfolio_values)) / np.maximum.accumulate(portfolio_values))
+    
+    print("\nTest Results:")
+    print(f"  Test Cumulative Return: {test_cumulative_return:.2%}")
+    print(f"  Test Sharpe Ratio: {test_sharpe_ratio:.4f}")
+    print(f"  Test Max Drawdown: {test_max_drawdown:.2%}")
+    
+    # Print final portfolio weights with consistent spacing
+    final_weights = test_weights_history[-1]
+    print("\nFinal Test Portfolio Weights:")
+    for name, weight in zip(stock_names, final_weights):
+        print(f"  {name}: {weight:.4f}")
+
 def main():
     # Load and preprocess stock data
     print("Loading and combining datasets...")
     stocks_df = load_and_combine_datasets()
 
-    # Calculate daily returns
-    returns_df, stock_names = calculate_returns(stocks_df)
+    # Calculate daily returns and split data
+    train_data, test_data, stock_names = calculate_returns(stocks_df)
 
-    # Train the DQN agent
-    print("\nTraining the DQN agent...")
-    train_dqn(returns_df, stock_names)
+    # Train and evaluate the DQN agent
+    print("\nTraining and evaluating the DQN agent...")
+    agent = train_and_evaluate_dqn(train_data, test_data, stock_names)
 
 if __name__ == "__main__":
     main()
