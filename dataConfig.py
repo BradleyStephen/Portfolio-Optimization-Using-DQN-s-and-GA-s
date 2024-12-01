@@ -3,11 +3,15 @@ import pandas as pd
 import random
 from datetime import datetime
 
+# Set fixed random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+
 # Genetic Algorithm Parameters
-POPULATION_SIZE = 500    # Adjusted for balance
-GENERATIONS = 50         # Adjusted for balance
-MUTATION_RATE = 0.1      # Encourages exploration
-ELITISM_RATE = 0.05      # Maintains diversity
+POPULATION_SIZE = 500
+GENERATIONS = 50
+MUTATION_RATE = 0.1
+ELITISM_RATE = 0.05
 
 # Investment Parameters
 BUDGET = 100000  # $100,000
@@ -15,9 +19,11 @@ RISK_FREE_RATE = 0.01  # 1% annual risk-free rate
 
 # Portfolio Constraints
 MIN_WEIGHT = 0.0
-MAX_WEIGHT = 0.15  # Maximum allocation per stock
-REGULARIZATION_FACTOR = 0.1  # Reduced penalty to prevent overpowering the fitness
-RETURN_DIFF_PENALTY_FACTOR = 5.0  # Penalty for high discrepancy in returns
+MAX_WEIGHT = 0.15
+REGULARIZATION_FACTOR = 0.2
+RETURN_RATIO_PENALTY_FACTOR = 50.0
+L1_REGULARIZATION_FACTOR = 0.02
+SHARPE_DIFF_PENALTY_FACTOR = 5.0
 
 LATEST_COMMON_START_DATE = '2015-01-01'  # Align all datasets to start from this date
 
@@ -58,8 +64,8 @@ def load_and_combine_datasets():
     
     return stocks
 
-def split_train_validation_test(stocks_df):
-    """Split data into training, validation, and testing sets based on date ranges"""
+def split_train_test(stocks_df):
+    """Split data into training and testing sets based on an 80/20 split"""
     stocks_df['Date'] = pd.to_datetime(stocks_df['Date'])
     
     # Adjust date ranges based on data availability
@@ -67,87 +73,123 @@ def split_train_validation_test(stocks_df):
     latest_date = stocks_df['Date'].max()
     print(f"Data available from {earliest_date} to {latest_date}")
 
-    # Define date ranges
-    train_end_date = '2020-12-31'
-    validation_end_date = '2021-06-30'
-    
+    # Calculate the index to split at (80% of the data)
+    split_index = int(0.8 * len(stocks_df))
+    split_date = stocks_df['Date'].iloc[split_index]
+
     # Split data
-    train_df = stocks_df[stocks_df['Date'] <= train_end_date]
-    validation_df = stocks_df[(stocks_df['Date'] > train_end_date) & (stocks_df['Date'] <= validation_end_date)]
-    test_df = stocks_df[stocks_df['Date'] > validation_end_date]
-    
+    train_df = stocks_df[stocks_df['Date'] < split_date]
+    test_df = stocks_df[stocks_df['Date'] >= split_date]
+
     # Print data split info
     print(f"\nData Split:")
     print(f"Training period: {train_df['Date'].min()} to {train_df['Date'].max()}")
     print(f"Training samples: {len(train_df)}")
-    print(f"Validation period: {validation_df['Date'].min()} to {validation_df['Date'].max()}")
-    print(f"Validation samples: {len(validation_df)}")
     print(f"Testing period: {test_df['Date'].min()} to {test_df['Date'].max()}")
     print(f"Testing samples: {len(test_df)}")
-    
-    return train_df, validation_df, test_df
+
+    return train_df, test_df
 
 def calculate_returns(df):
-    """Calculate returns for all stocks in the dataset"""
+    """Calculate log returns for all stocks in the dataset"""
     stock_names = [col.split('_')[0] for col in df.columns if '_Close' in col]
     close_cols = [f"{stock}_Close" for stock in stock_names]
-    returns_df = df[close_cols].pct_change().dropna()
+    prices = df[close_cols]
+    returns_df = np.log(prices / prices.shift(1)).dropna()
     returns_df.columns = stock_names
     return returns_df, stock_names
 
 def portfolio_metrics(weights, returns_df):
-    """Calculate portfolio metrics including Sharpe ratio"""
+    """Calculate portfolio metrics including Sharpe ratio and annualized total return"""
     portfolio_returns = returns_df.dot(weights)
     mean_daily_return = portfolio_returns.mean()
     daily_return_std = portfolio_returns.std()
     
     if daily_return_std == 0:
         return 0, 0, 0, 0, 0, 0, 0  # Avoid division by zero
-    
+
     # Annualize the returns
     annual_return = mean_daily_return * 252
     annual_std = daily_return_std * np.sqrt(252)
-    
+
     sharpe_ratio = (annual_return - RISK_FREE_RATE) / annual_std
-    
+
     # Calculate maximum drawdown
     cum_returns = (1 + portfolio_returns).cumprod()
-    rolling_max = cum_returns.expanding().max()
+    rolling_max = cum_returns.cummax()
     drawdowns = (cum_returns - rolling_max) / rolling_max
     max_drawdown = drawdowns.min()
-    
+
     # Calculate total return over the entire period
     total_return = cum_returns.iloc[-1] - 1
-    
+
+    # Number of trading days in the period
+    num_days = len(portfolio_returns)
+
+    # Annualized total return adjusted for period length
+    annualized_total_return = (1 + total_return) ** (252 / num_days) - 1
+
     # Calculate Sortino Ratio
     negative_returns = portfolio_returns[portfolio_returns < 0]
     downside_std = negative_returns.std() * np.sqrt(252)
     sortino_ratio = (annual_return - RISK_FREE_RATE) / downside_std if downside_std != 0 else 0
-    
+
     # Calculate Calmar Ratio
     calmar_ratio = (annual_return - RISK_FREE_RATE) / abs(max_drawdown) if max_drawdown != 0 else 0
-    
-    return sharpe_ratio, annual_return, annual_std, max_drawdown, total_return, sortino_ratio, calmar_ratio
 
-def portfolio_fitness(weights, train_returns, validation_returns):
-    """Fitness function that evaluates performance on validation data and penalizes high training returns"""
+    return sharpe_ratio, annual_return, annual_std, max_drawdown, annualized_total_return, sortino_ratio, calmar_ratio
+
+def rolling_window_cross_validation(returns_df, window_size, step_size):
+    """Generator for rolling window cross-validation splits"""
+    num_samples = len(returns_df)
+    indices = np.arange(num_samples)
+    max_start_index = num_samples - window_size - step_size
+
+    for start in range(0, max_start_index + 1, step_size):
+        train_indices = indices[start:start + window_size]
+        val_indices = indices[start + window_size:start + window_size + step_size]
+        if len(val_indices) == 0:
+            break
+        yield train_indices, val_indices
+
+def portfolio_fitness_cv(weights, returns_df):
+    """Fitness function that evaluates performance using rolling window cross-validation"""
     if not all(MIN_WEIGHT <= w <= MAX_WEIGHT for w in weights) or abs(sum(weights) - 1) > 1e-6:
         return -np.inf
 
-    # Calculate Sharpe ratios and returns on training and validation data
-    sharpe_ratio_train, annual_return_train, _, _, _, _, _ = portfolio_metrics(weights, train_returns)
-    sharpe_ratio_val, annual_return_val, _, _, _, _, _ = portfolio_metrics(weights, validation_returns)
-    
-    # Regularization term
-    l2_penalty = REGULARIZATION_FACTOR * np.sum(np.square(weights))
+    window_size = int(0.5 * len(returns_df))  # Use 50% of data for training in each fold
+    step_size = int(0.2 * len(returns_df))    # Use next 20% of data for validation
+    sharpe_ratios = []
 
-    # Penalty for high training return compared to validation return
-    return_diff_penalty = RETURN_DIFF_PENALTY_FACTOR * max(0, (annual_return_train - annual_return_val))
+    for train_index, val_index in rolling_window_cross_validation(returns_df, window_size, step_size):
+        train_returns_cv = returns_df.iloc[train_index]
+        val_returns_cv = returns_df.iloc[val_index]
 
-    # Fitness function
-    fitness = sharpe_ratio_val - l2_penalty - return_diff_penalty
+        # Calculate metrics on training and validation data
+        sharpe_ratio_train, _, _, _, annualized_total_return_train, _, _ = portfolio_metrics(weights, train_returns_cv)
+        sharpe_ratio_val, _, _, _, annualized_total_return_val, _, _ = portfolio_metrics(weights, val_returns_cv)
+        
+        # Calculate overfitting penalties
+        return_ratio = (annualized_total_return_train / annualized_total_return_val) if annualized_total_return_val != 0 else np.inf
+        if return_ratio > 1.2:  # If training return is more than 20% higher than validation return
+            return_ratio_penalty = RETURN_RATIO_PENALTY_FACTOR * (return_ratio - 1.2)
+        else:
+            return_ratio_penalty = 0
 
-    return fitness
+        sharpe_diff_penalty = SHARPE_DIFF_PENALTY_FACTOR * max(0, (sharpe_ratio_train - sharpe_ratio_val))
+
+        # Regularization terms
+        l2_penalty = REGULARIZATION_FACTOR * np.sum(np.square(weights))
+        l1_penalty = L1_REGULARIZATION_FACTOR * np.sum(np.abs(weights))
+
+        # Fitness for this fold
+        fitness = sharpe_ratio_val - l2_penalty - l1_penalty - return_ratio_penalty - sharpe_diff_penalty
+        sharpe_ratios.append(fitness)
+
+    # Average fitness across all folds
+    avg_fitness = np.mean(sharpe_ratios)
+
+    return avg_fitness
 
 def initialize_population(pop_size, num_stocks):
     """Initialize random portfolio weights"""
@@ -180,7 +222,7 @@ def mutate(child, mutation_rate):
     """Mutate child weights"""
     for i in range(len(child)):
         if random.random() < mutation_rate:
-            mutation = np.random.normal(0, 0.02)  # Reduced mutation magnitude for stability
+            mutation = np.random.normal(0, 0.01)  # Reduced mutation magnitude for stability
             child[i] += mutation
     
     child = np.clip(child, MIN_WEIGHT, MAX_WEIGHT)
@@ -190,18 +232,18 @@ def mutate(child, mutation_rate):
         child /= child.sum()
     return child
 
-def genetic_algorithm(train_returns, validation_returns, generations, pop_size, mutation_rate, elitism_rate):
-    """Main genetic algorithm function with adjusted fitness function"""
-    num_stocks = len(train_returns.columns)
+def genetic_algorithm_cv(returns_df, generations, pop_size, mutation_rate, elitism_rate):
+    """Genetic algorithm function using cross-validation for fitness evaluation"""
+    num_stocks = len(returns_df.columns)
     population = initialize_population(pop_size, num_stocks)
     best_weights = None
     best_fitness = -np.inf
     no_improvement_count = 0
-    early_stopping_rounds = 15  # Allows for sufficient exploration
+    early_stopping_rounds = 20  # Increased for more exploration
 
     for generation in range(generations):
-        # Evaluate fitness
-        fitness_values = [portfolio_fitness(ind, train_returns, validation_returns) for ind in population]
+        # Evaluate fitness using cross-validation
+        fitness_values = [portfolio_fitness_cv(ind, returns_df) for ind in population]
 
         # Sort population by fitness
         sorted_population = [x for _, x in sorted(zip(fitness_values, population), key=lambda pair: pair[0], reverse=True)]
@@ -224,7 +266,7 @@ def genetic_algorithm(train_returns, validation_returns, generations, pop_size, 
         current_best_fitness = fitness_values_sorted[0]
         if current_best_fitness > best_fitness:
             best_fitness = current_best_fitness
-            best_weights = sorted_population[0]  # Corrected to select from sorted_population
+            best_weights = sorted_population[0]
             no_improvement_count = 0
         else:
             no_improvement_count += 1
@@ -242,7 +284,7 @@ def evaluate_portfolio(weights, returns_df, stock_names, period_name=""):
     """Evaluate portfolio performance"""
     print(f"\n{period_name} Portfolio Evaluation:")
     
-    sharpe_ratio, annual_return, annual_std, max_drawdown, total_return, sortino_ratio, calmar_ratio = portfolio_metrics(weights, returns_df)
+    sharpe_ratio, annual_return, annual_std, max_drawdown, annualized_total_return, sortino_ratio, calmar_ratio = portfolio_metrics(weights, returns_df)
     
     # Print allocation
     print("\nOptimal Allocation:")
@@ -256,8 +298,7 @@ def evaluate_portfolio(weights, returns_df, stock_names, period_name=""):
     print(f"Sortino Ratio: {sortino_ratio:.4f}")
     print(f"Calmar Ratio: {calmar_ratio:.4f}")
     print(f"Maximum Drawdown: {max_drawdown:.2%}")
-    print(f"Total Period Return: {total_return:.2%}")
-    print(f"Total Profit/Loss: ${BUDGET * total_return:.2f}")
+    print(f"Annualized Total Return: {annualized_total_return:.2%}")
     
     return {
         'sharpe_ratio': sharpe_ratio,
@@ -266,7 +307,7 @@ def evaluate_portfolio(weights, returns_df, stock_names, period_name=""):
         'annual_return': annual_return,
         'annual_std_dev': annual_std,
         'max_drawdown': max_drawdown,
-        'total_return': total_return
+        'annualized_total_return': annualized_total_return
     }
 
 def main():
@@ -274,43 +315,37 @@ def main():
     print("Loading and combining datasets...")
     stocks_df = load_and_combine_datasets()
     
-    # Split into training, validation, and testing sets
-    train_df, validation_df, test_df = split_train_validation_test(stocks_df)
+    # Split into training and testing sets using 80/20 split
+    train_df, test_df = split_train_test(stocks_df)
     
     # Check if training data is empty
     if train_df.empty:
         raise ValueError("Training dataset is empty. Please adjust your date ranges or check your data.")
 
     # Calculate returns for each set
-    train_returns, stock_names = calculate_returns(train_df)
-    validation_returns, _ = calculate_returns(validation_df)
+    returns_df, stock_names = calculate_returns(train_df)
     test_returns, _ = calculate_returns(test_df)
     
-    # Run genetic algorithm on training data with validation
-    print("\nOptimizing portfolio weights using training and validation data...")
-    best_weights = genetic_algorithm(
-        train_returns, validation_returns, GENERATIONS, POPULATION_SIZE, MUTATION_RATE, ELITISM_RATE
+    # Run genetic algorithm with cross-validation on training data
+    print("\nOptimizing portfolio weights using rolling window cross-validation...")
+    best_weights = genetic_algorithm_cv(
+        returns_df, GENERATIONS, POPULATION_SIZE, MUTATION_RATE, ELITISM_RATE
     )
     
-    # Evaluate on training, validation, and testing sets
-    train_metrics = evaluate_portfolio(best_weights, train_returns, stock_names, "Training")
-    validation_metrics = evaluate_portfolio(best_weights, validation_returns, stock_names, "Validation")
-    test_metrics = evaluate_portfolio(best_weights, test_returns, stock_names, "Testing")  # Fixed duplication
+    # Evaluate on training (full), and testing sets
+    train_metrics = evaluate_portfolio(best_weights, returns_df, stock_names, "Training")
+    test_metrics = evaluate_portfolio(best_weights, test_returns, stock_names, "Testing")
     
     # Print comparison
     print("\nPerformance Comparison:")
     print(f"Training Sharpe Ratio: {train_metrics['sharpe_ratio']:.4f}")
-    print(f"Validation Sharpe Ratio: {validation_metrics['sharpe_ratio']:.4f}")
     print(f"Testing Sharpe Ratio: {test_metrics['sharpe_ratio']:.4f}")
-    print(f"Training Return: {train_metrics['total_return']:.2%}")
-    print(f"Validation Return: {validation_metrics['total_return']:.2%}")
-    print(f"Testing Return: {test_metrics['total_return']:.2%}")
+    print(f"Training Annualized Return: {train_metrics['annualized_total_return']:.2%}")
+    print(f"Testing Annualized Return: {test_metrics['annualized_total_return']:.2%}")
     
     # Check for overfitting
-    if train_metrics['sharpe_ratio'] > 2 * test_metrics['sharpe_ratio']:
-        print("\nWarning: The model may be overfitting to the training data. Consider adjusting the Genetic Algorithm parameters or using more data.")
-    if train_metrics['total_return'] > 5 * test_metrics['total_return']:
-        print("Warning: The training return is significantly higher than the testing return, indicating potential overfitting.")
+    if train_metrics['annualized_total_return'] > 1.2 * test_metrics['annualized_total_return']:
+        print("Warning: The training annualized return is significantly higher than the testing annualized return, indicating potential overfitting.")
 
 if __name__ == "__main__":
     main()
